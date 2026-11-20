@@ -1,9 +1,18 @@
 from collections.abc import Collection
+from dataclasses import dataclass
 import sqlite3
 
 from archive_common import Unavailable
 from ingest.layout import SourceSpan
 from issue.manifest import ManifestLine, OrderManifest
+
+
+@dataclass(frozen=True, slots=True)
+class Transfer:
+    parent_id: str
+    child_id: str
+    rows: tuple[int, ...]
+    claim_floor: int
 
 
 def ensure_order_tables(db: sqlite3.Connection) -> None:
@@ -26,6 +35,54 @@ def ensure_order_tables(db: sqlite3.Connection) -> None:
         )
     ''')
     db.execute('CREATE INDEX IF NOT EXISTS orders_by_recording ON orders(recording_id, first_row, last_row)')
+    db.execute('''
+        CREATE TABLE IF NOT EXISTS order_transfers (
+            child_id TEXT PRIMARY KEY REFERENCES orders(order_id),
+            parent_id TEXT NOT NULL UNIQUE REFERENCES orders(order_id),
+            claim_floor INTEGER NOT NULL CHECK (claim_floor >= 0)
+        )
+    ''')
+
+
+def store_transfer(
+    db: sqlite3.Connection, parent_id: str, child_id: str, claim_floor: int
+) -> None:
+    db.execute(
+        'INSERT INTO order_transfers (child_id, parent_id, claim_floor) VALUES (?, ?, ?)',
+        (child_id, parent_id, claim_floor),
+    )
+
+
+def _transfer_rows(db: sqlite3.Connection, child_id: str) -> tuple[int, ...]:
+    return tuple(row_number for (row_number,) in db.execute('''
+        SELECT row_number FROM order_lines WHERE order_id = ? ORDER BY row_number
+    ''', (child_id,)))
+
+
+def find_transfer(db: sqlite3.Connection, child_id: str) -> Transfer | None:
+    row = db.execute(
+        'SELECT parent_id, claim_floor FROM order_transfers WHERE child_id = ?', (child_id,)
+    ).fetchone()
+    if row is None:
+        return None
+    parent_id, claim_floor = row
+    return Transfer(parent_id, child_id, _transfer_rows(db, child_id), claim_floor)
+
+
+def find_transfer_by_parent(db: sqlite3.Connection, parent_id: str) -> Transfer | None:
+    row = db.execute(
+        'SELECT child_id, claim_floor FROM order_transfers WHERE parent_id = ?', (parent_id,)
+    ).fetchone()
+    if row is None:
+        return None
+    child_id, claim_floor = row
+    return Transfer(parent_id, child_id, _transfer_rows(db, child_id), claim_floor)
+
+
+def is_child_order(db: sqlite3.Connection, order_id: str) -> bool:
+    return db.execute(
+        'SELECT 1 FROM order_transfers WHERE child_id = ?', (order_id,)
+    ).fetchone() is not None
 
 
 def store_order(db: sqlite3.Connection, order: OrderManifest) -> None:
@@ -48,7 +105,15 @@ def _load_order(
         SELECT row_number, source, source_offset, source_length FROM order_lines
         WHERE order_id = ? ORDER BY row_number
     ''', (order_id,)).fetchall()
-    if len(rows) != last - first + 1 or any(row[0] != first + index for index, row in enumerate(rows)):
+    numbers = [row[0] for row in rows]
+    if is_child_order(db, order_id):
+        # A hand-off order keeps only the actually transferred positions in
+        # original order; gaps are expected and are not delivered.
+        if not numbers or numbers[0] != first or numbers[-1] != last:
+            raise Unavailable(f'接办单 {order_id} 的转派清单不完整')
+        if any(left >= right for left, right in zip(numbers, numbers[1:])):
+            raise Unavailable(f'接办单 {order_id} 的转派清单顺序无效')
+    elif len(rows) != last - first + 1 or any(number != first + index for index, number in enumerate(numbers)):
         raise Unavailable(f'交接单 {order_id} 的冻结清单不完整')
     try:
         lines = tuple(

@@ -2,7 +2,7 @@ import sqlite3
 
 from archive_common import Conflict, InvalidRequest, require_name, transaction
 from issue.manifest import OrderManifest, freeze_manifest
-from issue.register import find_order, store_order
+from issue.register import find_order, is_child_order, store_order
 from issue.selection import select_closed_range
 
 
@@ -16,6 +16,8 @@ def issue(
     with transaction(db, write=True):
         existing = find_order(db, order_id)
         if existing is not None:
+            if is_child_order(db, order_id):
+                raise Conflict(f'交接单 {order_id} 已作为接办单占用')
             if (existing.recording_id, existing.first, existing.last) != (recording_id, first, last):
                 raise Conflict(f'交接单 {order_id} 已以不同选行出票')
             return existing

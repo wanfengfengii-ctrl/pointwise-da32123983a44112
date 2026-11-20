@@ -2,12 +2,12 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
 
-from delivery.receive import confirm
+from delivery.receive import claim, confirm
 from ingest.layout import source_records
 from ingest.recording import seal
 from ingest.workspace import open_archive
 from issue.orders import issue
-
+from issue.transfer import transfer
 
 SAMPLES = Path(__file__).resolve().parent.parent / 'samples'
 RECORDING = 'probe-01'
@@ -46,3 +46,18 @@ class ArchiveCase(unittest.TestCase):
         receipt_a = confirm(self.db, '甲', '白班', [2]).receipt
         receipt_b = confirm(self.db, '乙', '白班', [3]).receipt
         return sealed.page_ids[1], receipt_a, receipt_b
+
+
+class TransferCase(ArchiveCase):
+    """Shared hand-off fixture mirroring the TRANSFER.md worked example."""
+
+    def setUp(self):
+        super().setUp()
+        self.sealed = self.seed_shift()
+        issue(self.db, '甲', RECORDING, 1, 4)
+
+    def hand_off(self, parent_claim_rows=(2, 2), rows=(2, 3), *, take_child_claim=True):
+        parent_claim = claim(self.db, '甲', *parent_claim_rows) if parent_claim_rows else None
+        manifest = transfer(self.db, '甲', '乙', list(rows))
+        child_claim = claim(self.db, '乙') if take_child_claim else None
+        return parent_claim, manifest, child_claim

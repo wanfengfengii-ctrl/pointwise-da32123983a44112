@@ -2,13 +2,21 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 import sqlite3
 
-from archive_common import Conflict, InvalidRequest, UnknownRecord, require_name, transaction
-from delivery.coverage import confirmed_rows
-from delivery.payload import DeliveredLine, load_original_lines
-from delivery.receipts import Receipt, append_receipt, find_receipt, list_receipts
-from delivery.resume import pending_lines
-from issue.manifest import OrderManifest
-from issue.register import find_order
+from archive_common import Conflict, InvalidRequest, require_name, transaction
+from delivery.payload import DeliveredLine
+from delivery.receipts import Receipt, append_receipt, find_receipt
+from delivery.settlement import (
+    ClaimReceipt,
+    ClaimResult,
+    claim as _claim,
+    confirm_claim as _confirm_claim,
+    find_claim_receipt,
+    pending_deliveries,
+    received_rows,
+    require_order,
+    settle_rows,
+)
+from issue.register import find_transfer_by_parent, is_child_order
 
 
 @dataclass(frozen=True, slots=True)
@@ -17,22 +25,25 @@ class ConfirmationResult:
     confirmed: tuple[int, ...]
 
 
-def _require_order(db: sqlite3.Connection, order_id: str) -> OrderManifest:
-    order = find_order(db, order_id)
-    if order is None:
-        raise UnknownRecord(f'未知交接单 {order_id}')
-    return order
-
-
 def read(
     db: sqlite3.Connection, order_id: str, first: int | None = None, last: int | None = None
 ) -> tuple[DeliveredLine, ...]:
     require_name(order_id, '交接单号')
     with transaction(db):
-        order = _require_order(db, order_id)
-        received = confirmed_rows(list_receipts(db, order_id))
-        lines = pending_lines(order, received, first, last)
-        return load_original_lines(db, order.recording_id, lines)
+        order = require_order(db, order_id)
+        return pending_deliveries(db, order, first, last)
+
+
+def claim(
+    db: sqlite3.Connection, order_id: str, first: int | None = None, last: int | None = None
+) -> ClaimResult:
+    return _claim(db, order_id, first, last)
+
+
+def confirm_claim(
+    db: sqlite3.Connection, order_id: str, request_id: str, claim_id: str, row_numbers: Iterable[int]
+) -> ClaimReceipt:
+    return _confirm_claim(db, order_id, request_id, claim_id, row_numbers)
 
 
 def confirm(
@@ -45,14 +56,30 @@ def confirm(
         raise InvalidRequest('确认须提供整数原行位')
     numbers = tuple(sorted(set(supplied)))
     with transaction(db, write=True):
-        order = _require_order(db, order_id)
+        order = require_order(db, order_id)
         members = {line.row_number for line in order.lines}
         if not members.issuperset(numbers):
             raise InvalidRequest(f'确认包含交接单 {order_id} 范围以外的原行')
-        receipt = find_receipt(db, order_id, request_id)
-        if receipt is None:
-            receipt = append_receipt(db, order_id, request_id, numbers)
-        elif receipt.row_numbers != numbers:
-            raise Conflict(f'交接单 {order_id} 的确认请求 {request_id} 已以不同原行集合提交')
-        received = confirmed_rows(list_receipts(db, order_id))
-        return ConfirmationResult(receipt, tuple(sorted(received)))
+
+        recorded = find_receipt(db, order_id, request_id)
+        if recorded is not None:
+            if recorded.row_numbers != numbers:
+                raise Conflict(f'交接单 {order_id} 的确认请求 {request_id} 已以不同原行集合提交')
+            return ConfirmationResult(recorded, tuple(sorted(received_rows(db, order))))
+
+        if find_claim_receipt(db, order_id, request_id) is not None:
+            raise Conflict(f'交接单 {order_id} 的确认请求 {request_id} 已由凭据点收入口使用')
+
+        # The legacy entry keeps its replay semantics for its own request ids.
+        # A fresh request may only settle rows an ordinary order still owns:
+        # every row on a hand-off order belongs to the credential flow, and a
+        # transferred row belongs to the receiving shift.
+        if is_child_order(db, order_id):
+            raise InvalidRequest(f'交接单 {order_id} 为接办单，须凭凭据点收')
+        outgoing = find_transfer_by_parent(db, order_id)
+        handed_off = frozenset() if outgoing is None else frozenset(outgoing.rows)
+        if any(number in handed_off for number in numbers):
+            raise InvalidRequest(f'确认包含交接单 {order_id} 已转派的行位')
+        settle_rows(db, order_id, request_id, numbers)
+        receipt = append_receipt(db, order_id, request_id, numbers)
+        return ConfirmationResult(receipt, tuple(sorted(received_rows(db, order))))

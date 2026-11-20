@@ -3,6 +3,7 @@ import sqlite3
 
 from archive_common import require_name, transaction
 from delivery.receipts import Receipt
+from delivery.settlement import Handoff, handoffs
 from issue.manifest import OrderManifest
 from reconcile.lines import AccountLine, build_account_lines
 from reconcile.totals import MeasurementTotals, summarize_measurements
@@ -19,6 +20,7 @@ class AccountReport:
     confirmed_total: MeasurementTotals
     pending_total: MeasurementTotals
     receipts: tuple[Receipt, ...]
+    handoffs: tuple[Handoff, ...]
 
 
 def account(db: sqlite3.Connection, order_id: str) -> AccountReport:
@@ -32,4 +34,5 @@ def account(db: sqlite3.Connection, order_id: str) -> AccountReport:
             evidence.order, lines, confirmed, pending,
             summarize_measurements(lines), summarize_measurements(confirmed),
             summarize_measurements(pending), evidence.receipts,
+            handoffs(db, order_id),
         )
